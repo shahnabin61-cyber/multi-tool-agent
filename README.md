@@ -1,50 +1,61 @@
-# Multi-Tool ReAct Agent
+# Multi-Tool ReAct Agent (with Document Retrieval)
 
-An LLM-powered agent that reasons about multi-step tasks and decides which tool to call — calculator, web search, or Python code execution — using the ReAct (Reason + Act) pattern. Built with Google's Gemini API.
+An LLM-powered agent that reasons about multi-step tasks and decides which tool to call — calculator, web search, Python code execution, or document retrieval — using the ReAct (Reason + Act) pattern. Built with Google's Gemini API.
 
 ## Why an agent, not just an LLM call
 
-A single LLM call is reactive: ask a question, get an answer, done. It can't reliably do exact arithmetic, doesn't know anything after its training cutoff, and can't run real computation. An agent addresses this by looping: the LLM reasons about what it needs, calls a real tool to get it, observes the result, and decides whether it has enough information to answer or needs another step.
+A single LLM call is reactive: ask a question, get an answer, done. It can't reliably do exact arithmetic, doesn't know anything after its training cutoff, and can't ground answers in a specific document set. An agent addresses this by looping: the LLM reasons about what it needs, calls a real tool to get it, observes the result, and decides whether it has enough information to answer or needs another step.
 
 ## Architecture
 
 1. **Thought** — the LLM reasons about what to do next
-2. **Action** — it specifies a tool call, e.g. `web_search("population of Nepal")`
+2. **Action** — it specifies a tool call, e.g. `retrieve_documents("death penalty")`
 3. **Observation** — the tool actually runs (outside the LLM), and its real output is fed back
 4. **Repeat** until the LLM has enough information, then it outputs a **Final Answer**
 
 ## Tools
 
-- **`calculator(expression)`** — evaluates math expressions using a restricted AST-based evaluator (not Python's `eval()`, which would allow arbitrary code execution)
-- **`web_search(query)`** — searches the web via DuckDuckGo (`ddgs` library, no API key required)
-- **`execute_code(code)`** — runs Python code in a restricted namespace (limited builtins only, no file/import access)
+- **`calculator(expression)`** — restricted AST-based math evaluator (not `eval()`, which allows arbitrary code execution)
+- **`web_search(query)`** — DuckDuckGo search (`ddgs` library, no API key required)
+- **`execute_code(code)`** — Python execution in a restricted namespace (limited builtins, no file/import access)
+- **`retrieve_documents(query)`** — hybrid retrieval + cross-encoder re-ranking over an indexed document set (built and tested against the Constitution of Nepal)
 
-Each tool was tested independently before wiring into the agent loop:
-- Calculator: correctly evaluated `47 * 892`, `(15+3)/2`, `2**10`
-- Web search: returned real, current results (e.g. Nepal's 2026 population data from Worldometer)
-- Code execution: correctly ran list comprehensions and aggregation functions
+## The retrieval tool's debugging journey
 
-## Test run: multi-step reasoning
+Building a genuinely reliable `retrieve_documents` tool took three iterations, each revealing a different real limitation of retrieval techniques:
 
-Test question: *"What is 15% of the current population of Nepal?"* — this requires two sequential steps (search, then calculate), which a single LLM call cannot do reliably (LLMs frequently hallucinate current statistics and cannot reliably do arithmetic without hallucination).
+**1. Naive score blending (BM25 + embeddings, normalized and summed) — failed.**
+Query: *"What does the constitution say about the death penalty?"* The correct article (16, "No law shall be made for capital punishment") was buried because an unrelated article (301) scored an inflated BM25 value from generic keyword overlap ("constitution," "provisions"), skewing the normalization.
 
-**Result (Step 1):** the agent correctly reasoned `"I need to find the current population of Nepal first"`, called `web_search("current population of Nepal 2024")`, and received real data (~29.6 million from Worldometer, September 2026). This confirms the core ReAct loop — reasoning followed by a correct tool selection — works as designed.
+**2. Reciprocal Rank Fusion (RRF) — also failed.**
+RRF combines rankings instead of raw scores, which normally protects against exactly this kind of score-scale skew. But diagnosis showed Article 16 ranked #1 in embeddings yet **276th out of 285 in BM25** (since "capital punishment" shares almost no words with "death penalty"), while Article 301 ranked #1 in *both* signals. RRF assumes the two methods make independent errors that cancel out — but here both methods independently and correlated-ly preferred the wrong article, so fusion couldn't recover the right one.
 
-The full run (search → calculate → final answer) was cut short by hitting the Gemini free-tier daily quota (20 requests/day) during testing, shared across this and a concurrent RAG project built the same day. Given each of the three tools was independently verified and Step 1 of the full agent loop executed correctly, the architecture is sound; a full end-to-end trace is straightforward to capture with a fresh quota.
+**3. Cross-encoder re-ranking — succeeded.**
+Instead of comparing separately-computed query/document embeddings, a cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) scores the query and each candidate document *jointly*, letting it directly reason about whether "capital punishment" and "death penalty" refer to the same concept. Retrieving a wider candidate set (top 15 by embeddings) and re-ranking with the cross-encoder correctly surfaced Article 16 at rank 1.
+
+**Key lesson:** hybrid search (naive or RRF) only helps when different retrieval methods make *different* mistakes that offset each other. When methods agree on the same wrong answer, only a technique that can reason about the query and document jointly (like a cross-encoder) can fix it.
+
+One further, smaller finding: the cross-encoder's ranking is somewhat sensitive to query phrasing — a short query ("death penalty") ranked the correct article lower than the full natural-language question did, suggesting production use should prefer passing the agent's full question to the retriever rather than an extracted keyword phrase.
+
+## Agent tool-selection test
+
+Given the question *"What does the Nepal constitution say about the death penalty?"*, the agent correctly reasoned that this required constitutional document search and selected `retrieve_documents` (not `web_search`) — confirming the tool-selection logic works as intended for domain-specific questions.
+
+A full multi-step trace (retrieval → synthesis) was limited by the Gemini free-tier daily quota (20 requests/day) during testing; the tool-selection step completed successfully before the quota was hit.
 
 ## Structure
 ```
 src/
-  tools.py   # calculator, web_search, execute_code
+  tools.py   # calculator, web_search, execute_code, DocumentRetriever (hybrid + cross-encoder)
   agent.py   # ReAct loop and tool dispatch
 notebooks/   # step-by-step exploration notebook (Colab), with markdown explanations
 ```
 
 ## Stack
-Python, Google Gemini API, `ddgs`
+Python, Google Gemini API, `sentence-transformers` (bi-encoder + cross-encoder), FAISS, `rank_bm25`, `ddgs`
 
 ## What's next
 - Complete a full end-to-end multi-step trace once API quota resets
-- Add more tools (e.g. a weather API, a file reader) to test tool-selection accuracy as options grow
-- Add retry/error-handling for malformed agent actions (currently returns an error string but doesn't let the agent self-correct)
-- Apply this agent pattern to NEPSE data (fetch stock data + compute stats + reason about trends) as a domain-specific extension
+- Investigate the query-phrasing sensitivity found in cross-encoder re-ranking
+- Add more document sources to retrieval, testing whether the agent correctly picks among multiple document sets
+- Apply this pattern to a domain-specific extension (e.g. NEPSE company filings/news retrieval)
